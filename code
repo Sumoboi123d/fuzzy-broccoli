@@ -10,6 +10,10 @@
     PERF UPDATES (no feature changes):
       • Removed O(n^2) lookup in Heartbeat by storing Character in packet
       • Throttled proxy sync to 20 Hz instead of every Heartbeat
+      • Cached core parts for invis checks (no more full GetDescendants walking each tick)
+      • Proxy rigs created once per character and reused (no churn)
+      • Plot refresh is per-plot with micro-debounce (no global rescans on every tiny change)
+      • Distance text updates only when the displayed meters change
 ]]--
 
 --// Services
@@ -48,9 +52,12 @@ type Packet = {
     Label: TextLabel?,
     Head: BasePart?,
     HRP: BasePart?,
-    Character: Model?,             -- PERF: keep direct ref (removes O(n^2) search)
+    Character: Model?,
     ProxyRig: Model?,
-    ProxyMap: {[BasePart]: BasePart}?
+    ProxyMap: {[BasePart]: BasePart}?,
+    ProxyActive: boolean?,
+    CoreParts: {BasePart}?,
+    LastShownMeters: number?,
 }
 local PerPlayer: {[Player]: Packet} = {}
 local Connections: {[Player]: {RBXScriptConnection}} = {}
@@ -179,20 +186,6 @@ do
     end)
 end
 
--- Toggle visuals
-local function setToggleVisual(on: boolean)
-    if on then
-        toggleBtn.Text = "ON"
-        toggleBtn.BackgroundColor3 = PANEL_ACCENT
-        toggleBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    else
-        toggleBtn.Text = "OFF"
-        toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 78)
-        toggleBtn.TextColor3 = Color3.fromRGB(220,220,230)
-    end
-end
-
--- Helpers
 local function cleanupPlayer(player: Player)
     if Connections[player] then
         for _, c in ipairs(Connections[player]) do
@@ -232,10 +225,10 @@ local function makeNameBillboard(head: BasePart, player: Player)
     return bb, label
 end
 
--- NEW: Make a lightweight, client-only proxy rig with anchored parts
+-- proxy rig builder (lazy; reused forever)
 local function createProxyRigFor(character: Model): (Model, {[BasePart]: BasePart})
     local proxy = Instance.new("Model")
-    proxy.Name = "_ESPProxy_" .. (character:GetFullName():gsub("%W",""))
+    proxy.Name = "_ESPProxy_" .. (character:GetDebugId():gsub("%W",""))
     proxy.Parent = PROXY_FOLDER
 
     local map: {[BasePart]: BasePart} = {}
@@ -259,82 +252,77 @@ local function createProxyRigFor(character: Model): (Model, {[BasePart]: BasePar
     return proxy, map
 end
 
--- Check if a character is “invisible” (all main parts hidden)
-local MAIN_PART_NAMES = {
-    Head=true, UpperTorso=true, LowerTorso=true, Torso=true,
-    LeftUpperArm=true, LeftLowerArm=true, LeftHand=true,
-    RightUpperArm=true, RightLowerArm=true, RightHand=true,
-    LeftUpperLeg=true, LeftLowerLeg=true, LeftFoot=true,
-    RightUpperLeg=true, RightLowerLeg=true, RightFoot=true,
-    ["Left Arm"]=true, ["Right Arm"]=true, ["Left Leg"]=true, ["Right Leg"]=true,
+-- cache core parts once; avoids tree walks every tick
+local CORE_NAMES = {
+    "Head","UpperTorso","LowerTorso","Torso",
+    "LeftUpperArm","LeftLowerArm","LeftHand",
+    "RightUpperArm","RightLowerArm","RightHand",
+    "LeftUpperLeg","LeftLowerLeg","LeftFoot",
+    "RightUpperLeg","RightLowerLeg","RightFoot",
+    "Left Arm","Right Arm","Left Leg","Right Leg",
+    "HumanoidRootPart",
 }
+local function collectCoreParts(character: Model): {BasePart}
+    local core: {BasePart} = {}
+    for _, name in ipairs(CORE_NAMES) do
+        local p = character:FindFirstChild(name)
+        if p and p:IsA("BasePart") then
+            table.insert(core, p)
+        end
+    end
+    -- fallback: include any BasePart directly under character (cheap)
+    if #core == 0 then
+        for _, d in ipairs(character:GetChildren()) do
+            if d:IsA("BasePart") then table.insert(core, d) end
+        end
+    end
+    return core
+end
 
-local function isCharacterInvisible(character: Model): boolean
-    local anyVisible = false
-    for _, desc in ipairs(character:GetDescendants()) do
-        if desc:IsA("BasePart") and MAIN_PART_NAMES[desc.Name] then
-            local lt = (desc.LocalTransparencyModifier or 0)
-            local t  = desc.Transparency
+local function isCharacterInvisibleFast(coreParts: {BasePart}): boolean
+    for _, part in ipairs(coreParts) do
+        if part.Parent then
+            local lt = (part.LocalTransparencyModifier or 0)
+            local t  = part.Transparency
             if (lt < 0.95) and (t < 0.95) then
-                anyVisible = true
-                break
+                return false
             end
         end
     end
-    return not anyVisible
+    return true
 end
 
--- Keep a proxy rig in sync with the source character
-local function updateProxyFromCharacter(map: {[BasePart]: BasePart}, character: Model)
-    for src, proxyPart in pairs(map) do
-        if src and src.Parent and proxyPart and proxyPart.Parent then
-            local ok1 = pcall(function() proxyPart.CFrame = src.CFrame end)
-            if ok1 and proxyPart.Size ~= src.Size then
-                pcall(function() proxyPart.Size = src.Size end)
-            end
+local function setProxyActive(pkt: Packet, active: boolean)
+    pkt.ProxyActive = active
+    if active then
+        if not pkt.ProxyRig or not pkt.ProxyRig.Parent then
+            local pr, map = createProxyRigFor(pkt.Character :: Model)
+            pkt.ProxyRig = pr
+            pkt.ProxyMap = map
         end
     end
-end
-
-local function ensureProxyActive(pkt: Packet, character: Model)
-    if not pkt.ProxyRig or not pkt.ProxyRig.Parent then
-        local proxy, map = createProxyRigFor(character)
-        pkt.ProxyRig = proxy
-        pkt.ProxyMap = map
-    end
-end
-
-local function destroyProxy(pkt: Packet)
-    if pkt.ProxyRig then pkt.ProxyRig:Destroy() end
-    pkt.ProxyRig = nil
-    pkt.ProxyMap = nil
 end
 
 --========================================================--
--- First-floor-only RemainingTime (ONE timer per plot)
+-- First-floor-only RemainingTime (ONE timer per plot), per-plot refresh
 --========================================================--
 local PLOTS = workspace:FindFirstChild("Plots")
 local FIRST_FLOOR_MAX_DISTANCE = 99999
 local FIRST_FLOOR_SIZE = UDim2.new(30, 0, 30, 0)
 
-local function firstFloorHideAll()
-    if not PLOTS then return end
-    for _, v in ipairs(PLOTS:GetDescendants()) do
-        if v.Name == "RemainingTime" and v.Parent and v.Parent:IsA("BillboardGui") then
-            (v.Parent :: BillboardGui).Enabled = false
-        end
-    end
-end
+-- per-plot state (no global rescans)
+local plotState: {[Instance]: {selected: BillboardGui?}} = {}
+local plotNextAllowed: {[Instance]: number} = {}
+local PLOT_COOLDOWN = 0.15 -- micro debounce
 
-local function firstFloorRefresh()
-    if not PLOTS then return end
-    for _, plot in ipairs(PLOTS:GetChildren()) do
-        local lowestGui: BillboardGui? = nil
-        local lowestY = math.huge
+local function refreshSinglePlot(plot: Instance)
+    local lowestGui: BillboardGui? = nil
+    local lowestY = math.huge
 
-        for _, d in ipairs(plot:GetDescendants()) do
-            if d.Name == "RemainingTime" and d.Parent and d.Parent:IsA("BillboardGui") then
-                local gui = d.Parent :: BillboardGui
+    for _, d in ipairs((plot :: Instance):GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "RemainingTime" then
+            local gui = d.Parent
+            if gui and gui:IsA("BillboardGui") then
                 local y
                 if gui.Adornee and gui.Adornee:IsA("BasePart") then
                     y = gui.Adornee.Position.Y
@@ -347,10 +335,13 @@ local function firstFloorRefresh()
                 end
             end
         end
+    end
 
-        for _, d in ipairs(plot:GetDescendants()) do
-            if d.Name == "RemainingTime" and d.Parent and d.Parent:IsA("BillboardGui") then
-                local gui = d.Parent :: BillboardGui
+    -- apply enable to winner, disable others (but only inside this plot)
+    for _, d in ipairs((plot :: Instance):GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "RemainingTime" then
+            local gui = d.Parent
+            if gui and gui:IsA("BillboardGui") then
                 if gui == lowestGui then
                     gui.Enabled = ESPEnabled
                     gui.MaxDistance = FIRST_FLOOR_MAX_DISTANCE
@@ -362,26 +353,59 @@ local function firstFloorRefresh()
             end
         end
     end
+
+    plotState[plot] = plotState[plot] or {}
+    plotState[plot].selected = lowestGui
+end
+
+local function schedulePlotRefresh(plot: Instance)
+    if not PLOTS then return end
+    local now = os.clock()
+    local nextAllowed = plotNextAllowed[plot] or 0
+    if now < nextAllowed then return end
+    plotNextAllowed[plot] = now + PLOT_COOLDOWN
+    task.defer(function()
+        if ESPEnabled and plot.Parent == PLOTS then
+            refreshSinglePlot(plot)
+        end
+    end)
+end
+
+local function firstFloorHideAll()
+    if not PLOTS then return end
+    for _, plot in ipairs(PLOTS:GetChildren()) do
+        local st = plotState[plot]
+        if st and st.selected and st.selected.Parent then
+            st.selected.Enabled = false
+        end
+    end
+end
+
+local function firstFloorInit()
+    if not PLOTS then return end
+    -- initial per-plot compute (once)
+    for _, plot in ipairs(PLOTS:GetChildren()) do
+        refreshSinglePlot(plot)
+    end
+    -- incremental updates (per-plot only)
+    PLOTS.ChildAdded:Connect(function(ch) schedulePlotRefresh(ch) end)
+    PLOTS.ChildRemoved:Connect(function(ch) plotState[ch] = nil end)
+    PLOTS.DescendantAdded:Connect(function(inst)
+        local plot = inst:FindFirstAncestorOfClass("Model") or inst:FindFirstAncestorWhichIsA("Folder")
+        if plot and plot.Parent == PLOTS then schedulePlotRefresh(plot) end
+    end)
+    PLOTS.DescendantRemoving:Connect(function(inst)
+        local plot = inst:FindFirstAncestorOfClass("Model") or inst:FindFirstAncestorWhichIsA("Folder")
+        if plot and plot.Parent == PLOTS then schedulePlotRefresh(plot) end
+    end)
 end
 
 if PLOTS then
-    firstFloorRefresh()
-    PLOTS.DescendantAdded:Connect(function(inst)
-        if inst.Name == "RemainingTime" or (inst:IsA("BillboardGui") and inst:FindFirstChild("RemainingTime")) then
-            task.defer(function()
-                if ESPEnabled then firstFloorRefresh() end
-            end)
-        end
-    end)
-    PLOTS.DescendantRemoving:Connect(function(_)
-        task.defer(function()
-            if ESPEnabled then firstFloorRefresh() end
-        end)
-    end)
+    firstFloorInit()
 end
 --========================================================--
 
--- Toggle all per-player visuals
+-- Toggle all per-player visuals (no proxy destroy; reuse)
 local function enableESPForPlayer(player: Player, enable: boolean)
     local pkt = PerPlayer[player]
     if not pkt then return end
@@ -395,18 +419,16 @@ local function enableESPForPlayer(player: Player, enable: boolean)
             (pkt.Billboard :: any).Enabled = enable
         end)
         if not ok then
-            if enable then
-                if pkt.Head and pkt.Billboard.Parent ~= pkt.Head then
-                    pkt.Billboard.Parent = pkt.Head
-                end
-            else
+            if enable and pkt.Head and pkt.Billboard.Parent ~= pkt.Head then
+                pkt.Billboard.Parent = pkt.Head
+            elseif not enable then
                 pkt.Billboard.Parent = nil
             end
         end
     end
 
     if not enable then
-        destroyProxy(pkt)
+        setProxyActive(pkt, false) -- keep built, just inactive
     end
 end
 
@@ -422,7 +444,7 @@ local function setESPEnabled(on: boolean)
     end
     if PLOTS then
         if on then
-            firstFloorRefresh()
+            for _, plot in ipairs(PLOTS:GetChildren()) do schedulePlotRefresh(plot) end
         else
             firstFloorHideAll()
         end
@@ -472,9 +494,12 @@ local function attachForCharacter(player: Player, character: Model)
         Label = label,
         Head = head,
         HRP = hrp,
-        Character = character, -- PERF: store direct ref
+        Character = character,
         ProxyRig = nil,
-        ProxyMap = nil
+        ProxyMap = nil,
+        ProxyActive = false,
+        CoreParts = collectCoreParts(character),
+        LastShownMeters = nil,
     }
 end
 
@@ -484,11 +509,13 @@ local function onPlayerAdded(player: Player)
         local pkt = PerPlayer[player]
         if pkt and pkt.Label then
             local base = (player.DisplayName ~= "" and player.DisplayName or player.Name)
-            pkt.Label.Text = base
+            pkt.Label.Text = pkt.LastShownMeters and (base .. "  [" .. pkt.LastShownMeters .. "m]") or base
         end
     end)
 
     local charConn = player.CharacterAdded:Connect(function(char)
+        -- clean previous packet if any (prevents doubles)
+        cleanupPlayer(player)
         task.defer(function()
             attachForCharacter(player, char)
             enableESPForPlayer(player, ESPEnabled)
@@ -518,42 +545,52 @@ end
 Players.PlayerAdded:Connect(onPlayerAdded)
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
--- Distance + invisibility updater (same cadence)
+-- Distance + invisibility updater (shared cadence; light work)
 task.spawn(function()
     while true do
-        task.wait(0.3)
+        task.wait(0.35)
         if not ESPEnabled then continue end
+
+        local lpChar = LocalPlayer.Character
+        local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+
         for plr, pkt in pairs(PerPlayer) do
-            if pkt and pkt.Label and pkt.HRP then
-                local lpChar = LocalPlayer.Character
-                local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-                if lpRoot then
-                    local dist = math.floor((lpRoot.Position - pkt.HRP.Position).Magnitude + 0.5)
+            -- distance label (only when value changes)
+            if lpRoot and pkt and pkt.Label and pkt.HRP then
+                local meters = math.floor((lpRoot.Position - pkt.HRP.Position).Magnitude + 0.5)
+                if pkt.LastShownMeters ~= meters then
+                    pkt.LastShownMeters = meters
                     local base = (plr.DisplayName ~= "" and plr.DisplayName or plr.Name)
-                    pkt.Label.Text = string.format("%s  [%dm]", base, dist)
+                    pkt.Label.Text = string.format("%s  [%dm]", base, meters)
                 end
             end
 
+            -- invisibility handling with cached core parts
             local char = pkt.Character
-            if char and pkt.Highlight then
-                local invisible = isCharacterInvisible(char)
+            if char and pkt.Highlight and pkt.CoreParts then
+                local invisible = isCharacterInvisibleFast(pkt.CoreParts)
                 if invisible then
-                    ensureProxyActive(pkt, char)
-                    if pkt.ProxyRig and pkt.ProxyMap then
+                    if not pkt.ProxyActive then
+                        setProxyActive(pkt, true)
+                    end
+                    if pkt.ProxyRig and pkt.Highlight.Adornee ~= pkt.ProxyRig then
                         pkt.Highlight.Adornee = pkt.ProxyRig
                     end
                 else
                     if pkt.Highlight.Adornee ~= char then
                         pkt.Highlight.Adornee = char
                     end
-                    destroyProxy(pkt)
+                    -- keep proxy built, just inactive
+                    if pkt.ProxyActive then
+                        setProxyActive(pkt, false)
+                    end
                 end
             end
         end
     end
 end)
 
--- PERF: throttle proxy sync to 20 Hz (reduces CPU without changing visuals)
+-- PERF: throttle proxy sync to 20 Hz & only when proxy is active
 local PROXY_UPDATE_INTERVAL = 1/20
 local accum = 0
 RunService.Heartbeat:Connect(function(dt)
@@ -562,8 +599,16 @@ RunService.Heartbeat:Connect(function(dt)
     accum -= PROXY_UPDATE_INTERVAL
 
     for _, pkt in pairs(PerPlayer) do
-        if pkt and pkt.ProxyRig and pkt.ProxyMap and pkt.Character then
-            updateProxyFromCharacter(pkt.ProxyMap, pkt.Character)
+        if pkt and pkt.ProxyActive and pkt.ProxyRig and pkt.ProxyMap and pkt.Character then
+            -- only sync while in use (active)
+            for src, proxyPart in pairs(pkt.ProxyMap) do
+                if src.Parent and proxyPart.Parent then
+                    local ok1 = pcall(function() proxyPart.CFrame = src.CFrame end)
+                    if ok1 and proxyPart.Size ~= src.Size then
+                        pcall(function() proxyPart.Size = src.Size end)
+                    end
+                end
+            end
         end
     end
 end)
@@ -573,3 +618,4 @@ toggleBtn.Text = "ON"; toggleBtn.BackgroundColor3 = PANEL_ACCENT
 _G.SetESPEnabled = function(on)
     setESPEnabled(on and true or false)
 end
+
